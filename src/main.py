@@ -23,20 +23,8 @@ from typing import Optional
 
 from wakeword import WakewordDetector
 from stt import STT
-
-try:
-    from tts import TTS  # your own module
-except ImportError:  # quick stub for testing without TTS engine
-    class TTS:  # noqa: D401, WPS601
-        def speak(self, text: str, block: bool = True) -> None:  # noqa: D401
-            print(f"[Robot ⇢ user] {text}")
-
-try:
-    from brain import Brain
-except ImportError:  # minimal stub so the file runs out‑of‑the‑box
-    class Brain:  # noqa: D401, WPS601
-        async def execute(self, text: str) -> str:  # noqa: D401
-            return f"You said: {text}"
+from tts import TTS
+from agent import Brain
 
 # ---------------------------------------------------------------------------
 # Configuration (override via CLI)
