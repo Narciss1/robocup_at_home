@@ -1,145 +1,205 @@
-"""
-main.py – glue code for the conversational robot
-------------------------------------------------
-• Waits for wake-word
-• Records user command (STT)
-• Hands command to Brain
-• Speaks Brain’s reply (TTS)
-• Loops for ever
-Replace the stubbed `Brain.execute()` with your real logic.
+"""main.py
+Entry‑point that wires **WakewordDetector**, **STT**, **Brain** and **TTS**
+together into the canonical loop:
+
+    wait → listen → think → speak → wait
+
+Requires the three sibling modules generated earlier:
+
+* ``wakeword.py`` – based on openwakeword + PyAudio
+* ``stt.py``       – realtime Whisper + webrtcvad
+* ``tts.py``       – any TTS backend (not shown here; plug in yours)
+* ``brain.py``     – your application logic (stubbed below)
+
+Run ``python main.py`` and say your wake‑word (e.g. *"hey_bot"*).
 """
 from __future__ import annotations
 
+import argparse
 import asyncio
-import concurrent.futures
-import pathlib
+import signal
+from pathlib import Path
 from typing import Optional
 
 from wakeword import WakewordDetector
-from src.stt import STT
-from src.tts import TTS
-from src.brain import Brain   # your own module
+from stt import STT
 
-# ---------- CONFIG ----------------------------------------------------------
+try:
+    from tts import TTS  # your own module
+except ImportError:  # quick stub for testing without TTS engine
+    class TTS:  # noqa: D401, WPS601
+        def speak(self, text: str, block: bool = True) -> None:  # noqa: D401
+            print(f"[Robot ⇢ user] {text}")
 
-WAKE_MODEL      = "hey_bot.ppn"
-WAKE_WORDS      = ["hey bot"]
-WAKE_SENS       = 0.55
-
-STT_MODEL       = "whisper-small"
-STT_LANGUAGE    = "en"
-
-VOICE_ID        = "en_US/vctk_low"
-
-# Silence after which we consider the user finished (seconds)
-LISTEN_TIMEOUT  = 6.0
+try:
+    from brain import Brain
+except ImportError:  # minimal stub so the file runs out‑of‑the‑box
+    class Brain:  # noqa: D401, WPS601
+        async def execute(self, text: str) -> str:  # noqa: D401
+            return f"You said: {text}"
 
 # ---------------------------------------------------------------------------
+# Configuration (override via CLI)
+# ---------------------------------------------------------------------------
 
-class RobotLoop:
-    """
-    Orchestrates Wake-word → STT → Brain → TTS.
-    """
+class _Config:  # noqa: WPS601
+    # Wake‑word -------------------------------------------------------------
+    wake_model_path: Optional[str | Path] = None  # folder or .tflite; None → built‑ins
+    inference_framework: str = "tflite"           # or "onnx"
+    threshold: float = 0.5                        # 0‑1 probability to trigger
+    chunk_size: int = 1_280                      # samples per inference
 
-    def __init__(self) -> None:
-        # Blocking wake-word detector put in a low-footprint thread pool
-        self._wake_detector = WakewordDetector(
-            model_path=WAKE_MODEL,
-            wake_words=WAKE_WORDS,
-            sensitivity=WAKE_SENS,
+    # STT -------------------------------------------------------------------
+    stt_model: str | Path = "base.en"            # faster‑whisper model name/path
+    stt_language: str = "en"
+    listen_timeout: float = 10.0                 # hard timeout per utterance (sec)
+
+    # TTS -------------------------------------------------------------------
+    tts_voice: str | None = None
+
+
+# ---------------------------------------------------------------------------
+# Orchestrator
+# ---------------------------------------------------------------------------
+
+class RobotLoop:  # noqa: WPS601
+    """Glue class that owns the other modules and their lifecycles."""
+
+    def __init__(self, cfg: _Config):
+        self.cfg = cfg
+
+        # Will be filled in once the event loop is running
+        self._loop: Optional[asyncio.AbstractEventLoop] = None
+
+        # 1) Wake-word detector (runs in its own thread) -------------------
+        self.detector = WakewordDetector(
+            model_path=cfg.wake_model_path,
+            chunk_size=cfg.chunk_size,
+            inference_framework=cfg.inference_framework,
+            sensitivity=cfg.threshold,
         )
 
-        self._brain = Brain()
-        self._stt   = STT(STT_MODEL, language=STT_LANGUAGE)
-        self._tts   = TTS(voice=VOICE_ID)
+        # 2) Speech-to-text -------------------------------------------------
+        self.stt = STT(
+            model=cfg.stt_model,
+            language=cfg.stt_language,
+        )
 
-        self._wake_event: asyncio.Event = asyncio.Event()
-        self._thread_pool: concurrent.futures.ThreadPoolExecutor | None = None
+        # 3) Brain + voice --------------------------------------------------
+        self.brain = Brain()
+        self.tts = TTS() if cfg.tts_voice is None else TTS(voice=cfg.tts_voice)
 
-    # ---------------------------------------------------------------------
+        # Signal from wake-word thread to asyncio loop ---------------------
+        self._wake_event = asyncio.Event()
+        self._listening = False  # prevent double-firing
 
-    async def run(self) -> None:
-        """
-        Main perpetual loop.
-        """
-        # 1) Kick off wake-word detector in its own thread
-        self._thread_pool = concurrent.futures.ThreadPoolExecutor(max_workers=1)
-        loop = asyncio.get_running_loop()
-        loop.run_in_executor(self._thread_pool, self._wake_loop_blocking)
+    # ------------------------------------------------------------------
+    async def run(self) -> None:  # noqa: WPS231
+        """Main coroutine; never returns unless cancelled."""
+        # Capture the running loop reference for thread callbacks --------
+        self._loop = asyncio.get_running_loop()
 
-        while True:
-            # 2) Block until a wake-word is heard -------------
+        # Register callback *before* starting detector -------------------
+        self.detector.set_callback(self._wake_callback)
+        self.detector.start()
+
+        while True:  # outer loop – wait for wake word -----------------
             await self._wake_event.wait()
             self._wake_event.clear()
 
-            print("[Robot] Wake-word detected. Listening …")
+            # Guard: ignore if already in the middle of listening -------
+            if self._listening:
+                continue
+            self._listening = True
 
-            # 3) Listen to the user ---------------------------
             try:
-                transcript = await asyncio.wait_for(
-                    self._stt.listen(timeout=LISTEN_TIMEOUT),   # plays start-chime inside
-                    timeout=LISTEN_TIMEOUT + 1.0,
-                )
+                transcript = await self.stt.listen(timeout=self.cfg.listen_timeout)
             except asyncio.TimeoutError:
-                print("[Robot] Listen timed out – back to sleep.")
+                print("[Robot] Listening timed-out; going back to idle.")
+                self._listening = False
+                continue
+            except Exception as exc:  # noqa: BLE001
+                print(f"[Robot] STT error: {exc}")
+                self._listening = False
                 continue
 
             if not transcript:
-                print("[Robot] No speech captured.")
+                print("[Robot] No speech detected – idle.")
+                self._listening = False
                 continue
 
-            print(f"[User] {transcript}")
+            print(f"[User ⇢ robot] {transcript}")
 
-            # 4) Brain decides a response ---------------------
-            reply: Optional[str] = await self._maybe_async(self._brain.execute, transcript)
+            # Brain may be sync or async --------------------------------
+            reply = await self._call_brain(transcript)
             if reply:
-                print(f"[Robot] {reply}")
-                # 5) Speak the answer --------------------------
-                self._tts.speak(reply)
+                self.tts.speak(reply)
 
-    # ------------------------- Helpers -------------------------------
+            self._listening = False
 
-    def _wake_loop_blocking(self) -> None:
-        """
-        Runs inside a background thread; converts Wake-word callbacks
-        into an asyncio.Event.
-        """
-        def _wake_callback(word: str, ts: float) -> None:
-            # “word” and “ts” come from detector; just nudge the event
-            asyncio.run_coroutine_threadsafe(
-                self._set_wake_event(), asyncio.get_running_loop()
-            )
-        self._wake_detector.set_callback(_wake_callback)
-        self._wake_detector.start()   # blocking forever
+    # ------------------------------------------------------------------
+    # Helpers
+    # ------------------------------------------------------------------
+    def _wake_callback(self, word: str, ts: float) -> None:  # noqa: D401
+        """Runs in *detector thread* – marshal to asyncio loop."""
+        if self._loop is None:
+            return  # should not happen but guards against race
+        # Notify main coroutine thread-safely
+        self._loop.call_soon_threadsafe(self._wake_event.set)
+        print(f"[Detector] Wake-word '{word}' @{ts:.3f}")
 
-    async def _set_wake_event(self) -> None:
-        self._wake_event.set()
+    async def _call_brain(self, text: str) -> str:  # noqa: D401
+        if asyncio.iscoroutinefunction(self.brain.execute):
+            return await self.brain.execute(text)  # type: ignore[arg-type]
+        return await asyncio.to_thread(self.brain.execute, text)
 
-    async def _maybe_async(self, fn, *a, **kw):
-        """
-        Await fn if it's a coroutine-function, else run in default loop.
-        """
-        if asyncio.iscoroutinefunction(fn):
-            return await fn(*a, **kw)          # type: ignore
-        return await asyncio.to_thread(fn, *a, **kw)
+    # ------------------------------------------------------------------
+    async def shutdown(self) -> None:  # noqa: D401
+        print("Shutting down …")
+        self.detector.stop()
+        self.stt.stop()
 
-    # -----------------------------------------------------------------
 
-    async def shutdown(self) -> None:
-        self._wake_detector.stop()
-        if self._thread_pool:
-            self._thread_pool.shutdown(wait=False)
-        await self._stt.stop()    # in case we're listening
-        print("Robot shut down cleanly.")
+# ---------------------------------------------------------------------------
+# CLI / bootstrap
+# ---------------------------------------------------------------------------
 
-# ------------------------- script entry -------------------------------
+def _parse_cli() -> _Config:
+    p = argparse.ArgumentParser(description="Simple voice assistant loop")
+    p.add_argument("--wake_model_path", default="models/robo-cup.tflite", help="Folder or single .tflite model")
+    p.add_argument("--framework", default="tflite", choices=["tflite", "onnx"], help="Inference framework")
+    p.add_argument("--threshold", type=float, default=0.5, help="Detection threshold 0-1")
+    p.add_argument("--stt_model", default="base.en", help="Whisper model or path")
+    args = p.parse_args()
 
-async def main() -> None:
-    bot = RobotLoop()
-    try:
-        await bot.run()
-    except (KeyboardInterrupt, SystemExit):
-        await bot.shutdown()
+    cfg = _Config()
+    cfg.wake_model_path = args.wake_model_path or None
+    cfg.inference_framework = args.framework
+    cfg.threshold = args.threshold
+    cfg.stt_model = args.stt_model
+    return cfg
+
+
+async def _main() -> None:  # noqa: D401
+    cfg = _parse_cli()
+    bot = RobotLoop(cfg)
+
+    # Graceful Ctrl-C handling -------------------------------------------
+    loop = asyncio.get_running_loop()
+
+    stop_ev = asyncio.Event()
+    for sig in (signal.SIGINT, signal.SIGTERM):
+        loop.add_signal_handler(sig, stop_ev.set)
+
+    runner = asyncio.create_task(bot.run())
+    await stop_ev.wait()
+    runner.cancel()
+    with contextlib.suppress(asyncio.CancelledError):
+        await runner
+    await bot.shutdown()
+
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    import contextlib
+
+    asyncio.run(_main())

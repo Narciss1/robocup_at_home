@@ -1,208 +1,211 @@
 """wakeword.py
-Implementation of WakewordDetector using the openwakeword package.
-Requirements:
-    pip install openwakeword sounddevice numpy
+Wake-word detector based on the **openwakeword** demo script by
+David Scripka (Apache‑2.0, 2022) but wrapped in an easy‑to‑reuse
+`WakewordDetector` class.
 
-Notes
------
-* Audio is captured at 16 kHz, 16‑bit mono.  Each chunk is 512 samples
-  (≈ 32 ms) which matches openwakeword’s default frame size.
-* If you pass an ``audio_source`` argument it must be an **async** or
-  synchronous iterator that yields raw ``bytes`` chunks in the same
-  format; otherwise a default **sounddevice** stream is started.
-* The detector runs in a background thread so the main thread stays
-  responsive.
+Differences to the reference script
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+* Runs in a background **thread** and not in the main loop.
+* Offers a callback `set_callback(fn)` rather than printing.
+* Adds duplicate‑trigger suppression, adjustable threshold, and
+  programmatic *add_wake_word()* at runtime.
+* Supports both a single `.tflite` model file *or* the bundled model
+  pack when `model_path` is empty.
+* Uses **PyAudio** for microphone capture (16 kHz, mono, int16).
 
-Example
--------
-from wakeword import WakewordDetector
-
-det = WakewordDetector(
-    model_path="models/",
-    wake_words=["hey_bot"],
-)
-
-det.set_callback(lambda word, ts: print("Detected:", word))
-det.start()
-try:
-    det.join()
-except KeyboardInterrupt:
-    det.stop()
+Quick CLI test
+--------------
+```bash
+python wakeword.py --chunk_size 1280 --model_path ./hey_bot.tflite \
+                   --inference_framework tflite
+```
+Speak your wake‑word; each detection prints a line.
 """
 from __future__ import annotations
 
-import asyncio
-import queue
+import argparse
 import threading
 import time
 from pathlib import Path
-from typing import Callable, Iterator, List, Optional
+from typing import Callable, List, Optional
 
 import numpy as np
-import sounddevice as sd
+import pyaudio
 from openwakeword.model import Model
 
 __all__ = ["WakewordDetector"]
-
-# ---------------------------------------------------------------------------
-# Helper: default live microphone source
-# ---------------------------------------------------------------------------
-
-def _microphone_source(
-    samplerate: int = 16_000,
-    chunk_size: int = 512,
-    dtype: str = "int16",
-) -> Iterator[bytes]:
-    """Yield ``chunk_size`` *frames* of raw PCM from the default mic."""
-
-    q: queue.Queue[bytes] = queue.Queue(maxsize=10)
-
-    def _callback(indata: np.ndarray, _frames: int, _time, _status):  # noqa: ANN001
-        q.put_nowait(indata.copy().tobytes())
-
-    with sd.InputStream(
-        samplerate=samplerate,
-        blocksize=chunk_size,
-        dtype=dtype,
-        channels=1,
-        callback=_callback,
-    ):
-        while True:
-            yield q.get()
-
 
 # ---------------------------------------------------------------------------
 # Main class
 # ---------------------------------------------------------------------------
 
 class WakewordDetector:
-    """High‑level wake‑word detection wrapper around **openwakeword**."""
+    """Background wake‑word listener built on **openwakeword** (TFLite/ONNX)."""
 
-    _DEFAULT_THRESHOLD = 0.5  # Prob. above which we fire the callback
-    _SUPPRESSION_SEC = 1.0    # Ignore duplicate triggers within X sec
+    _RATE = 16_000  # Hz
+    _CHANNELS = 1
+    _FORMAT = pyaudio.paInt16
+    _DEFAULT_CHUNK = 1_280  # ≈ 80 ms @ 16 kHz
+    _SUPPRESSION_SEC = 1.0
 
     def __init__(
         self,
-        model_path: str | Path,
-        wake_words: List[str],
+        model_path: str | Path | None = None,
+        *,
+        chunk_size: int = _DEFAULT_CHUNK,
+        inference_framework: str = "tflite",
         sensitivity: float = 0.5,
-        audio_source: Optional[Iterator[bytes]] = None,
     ) -> None:
-        self._model_path = Path(model_path)
-        self._wake_words = wake_words
+        """Parameters
+        ----------
+        model_path
+            Path to a **single** `.tflite`/`.onnx` model *or* a folder
+            containing several models.  If *None* or empty, all built‑in
+            openwakeword models are loaded.
+        chunk_size
+            Number of samples to read per `pyaudio.Stream.read()` call.
+        inference_framework
+            Either ``"tflite"`` (CPU/GPU) or ``"onnx"`` (CPU).
+        sensitivity
+            Probability threshold in [0, 1]; above → trigger.
+        """
+        self._chunk = int(chunk_size)
         self._threshold = float(sensitivity)
+
+        # ~~~~~ load models ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+        if model_path is None or str(model_path) == "":
+            self._model = Model(inference_framework=inference_framework)
+        else:
+            mp = Path(model_path)
+            if mp.is_file():
+                paths = [str(mp)]
+            else:
+                paths = [str(p) for p in mp.glob("*.tflite")]
+            self._model = Model(wakeword_models=paths, inference_framework=inference_framework)
+
+        self._wake_words: List[str] = list(self._model.models.keys())
+        self._last_detect: dict[str, float] = {w: 0.0 for w in self._wake_words}
+
+        # Callback function (word, timestamp) -> None
         self._callback: Optional[Callable[[str, float], None]] = None
 
-        # Build model list of file paths
-        model_paths = [str(self._model_path / f"{w}.tflite") for w in wake_words]
-        self._model = Model(wakeword_models=model_paths, inference_framework="tflite")
+        # PyAudio setup ---------------------------------------------------
+        self._pa = pyaudio.PyAudio()
+        self._stream: Optional[pyaudio.Stream] = None
 
-        self._audio_source = audio_source or _microphone_source()
-
-        self._thread: Optional[threading.Thread] = None
+        # Threading -------------------------------------------------------
         self._running = threading.Event()
-
-        # Deduplication state
-        self._last_detect_time: dict[str, float] = {w: 0.0 for w in wake_words}
+        self._thread: Optional[threading.Thread] = None
 
     # ------------------------------------------------------------------
-    # Life‑cycle
+    # Public API
     # ------------------------------------------------------------------
 
     def start(self) -> None:
-        """Start background audio‑processing thread."""
         if self._thread and self._thread.is_alive():
-            return  # already running
+            return
         self._running.set()
-        self._thread = threading.Thread(target=self._run, daemon=True)
+        self._thread = threading.Thread(target=self._loop, daemon=True)
         self._thread.start()
 
     def stop(self) -> None:
-        """Ask the background thread to finish and wait for it."""
         self._running.clear()
         if self._thread:
             self._thread.join(timeout=1.0)
+        if self._stream:
+            self._stream.stop_stream()
+            self._stream.close()
+            self._stream = None
+        if self._pa:
+            self._pa.terminate()
 
     def join(self, timeout: float | None = None) -> None:
-        """Block the caller until the detector thread finishes."""
         if self._thread:
-            self._thread.join(timeout=timeout)
+            self._thread.join(timeout)
 
-    # ------------------------------------------------------------------
+    # ..................................................................
     # Configuration
-    # ------------------------------------------------------------------
+    # ..................................................................
 
     def set_sensitivity(self, value: float) -> None:
-        """Set probability threshold between 0 and 1 (higher = stricter)."""
         self._threshold = max(0.0, min(1.0, value))
 
     def add_wake_word(self, word: str, model_path: str | Path) -> None:
-        """Load an *additional* model at runtime.
-
-        ``openwakeword`` supports adding more models with
-        :py:meth:`Model.add_wakeword` (>= v0.6).  We also extend the
-        deduplication dict.
-        """
         self._model.add_wakeword(str(model_path))
         self._wake_words.append(word)
-        self._last_detect_time[word] = 0.0
+        self._last_detect[word] = 0.0
 
-    # ------------------------------------------------------------------
+    # ..................................................................
     # Callback registration
-    # ------------------------------------------------------------------
+    # ..................................................................
 
     def set_callback(self, fn: Callable[[str, float], None]) -> None:
-        """Register a function called on detection: ``fn(word, time.time())``."""
         self._callback = fn
 
     # ------------------------------------------------------------------
-    # Private
+    # Internals
     # ------------------------------------------------------------------
 
-    def _run(self) -> None:
-        """Audio‑processing loop running in a **separate thread**."""
-        for chunk in self._audio_source:
-            if not self._running.is_set():
-                break
-            self._process_chunk(chunk)
+    def _open_stream(self) -> None:
+        if self._stream is None:
+            self._stream = self._pa.open(
+                format=self._FORMAT,
+                channels=self._CHANNELS,
+                rate=self._RATE,
+                input=True,
+                frames_per_buffer=self._chunk,
+            )
+
+    def _loop(self) -> None:
+        self._open_stream()
+        assert self._stream is not None
+        while self._running.is_set():
+            raw = self._stream.read(self._chunk, exception_on_overflow=False)
+            self._process_chunk(raw)
 
     # .................................................................
 
     def _process_chunk(self, pcm: bytes) -> None:
-        """Convert PCM → float32 and feed to model, then fire callback."""
-        # Convert int16 -> float32 in [-1, 1]
-        audio = np.frombuffer(pcm, dtype=np.int16).astype(np.float32) / 32768.0
-
+        audio = np.frombuffer(pcm, dtype=np.int16)
         probs = self._model.predict(audio)
-        # ``predict`` returns a list/np.ndarray with probability per model
-        for idx, prob in enumerate(probs):
+        ts = time.time()
+        for word, prob in probs.items():
             if prob < self._threshold:
                 continue
-            word = self._wake_words[idx]
-            now = time.time()
-            if now - self._last_detect_time[word] < self._SUPPRESSION_SEC:
-                continue  # within suppression window
-            self._last_detect_time[word] = now
+            if ts - self._last_detect[word] < self._SUPPRESSION_SEC:
+                continue
+            self._last_detect[word] = ts
             if self._callback:
-                # Dispatch from **this** background thread; if you need to
-                # hop into asyncio use `asyncio.get_event_loop().call_soon_threadsafe`.
-                self._callback(word, now)
+                self._callback(word, ts)
+            else:
+                print(f"[{time.strftime('%H:%M:%S')}] Wake‑word '{word}' detected → score={prob:.2f}")
+
+
+# ---------------------------------------------------------------------------
+# CLI helper for quick testing (mirrors reference script behaviour)
+# ---------------------------------------------------------------------------
+
+def _cli() -> None:
+    parser = argparse.ArgumentParser(description="Wake-word quick‑test")
+    parser.add_argument("--chunk_size", type=int, default=1280, help="Samples per inference call")
+    parser.add_argument("--model_path", type=str, default="models/robo-cup.tflite", help="Path to a specific model or folder of models")
+    parser.add_argument("--inference_framework", type=str, default="tflite", choices=["tflite", "onnx"])
+    parser.add_argument("--threshold", type=float, default=0.5, help="Trigger threshold 0‑1")
+    args = parser.parse_args()
+
+    det = WakewordDetector(
+        model_path=args.model_path or None,
+        chunk_size=args.chunk_size,
+        inference_framework=args.inference_framework,
+        sensitivity=args.threshold,
+    )
+
+    det.start()
+    try:
+        det.join()
+    except KeyboardInterrupt:
+        det.stop()
 
 
 if __name__ == "__main__":
-    # Example usage
-    detector = WakewordDetector(
-        model_path="models/",
-        wake_words=["hey_jarvis"],
-    )
-
-    def callback(word: str, timestamp: float) -> None:
-        print(f"Detected: {word} at {timestamp}")
-
-    detector.set_callback(callback)
-    detector.start()
-    try:
-        detector.join()
-    except KeyboardInterrupt:
-        detector.stop()
-        print("Detector stopped.")
+    _cli()
