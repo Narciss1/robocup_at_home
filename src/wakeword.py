@@ -1,6 +1,6 @@
 """wakeword.py
 Wake-word detector based on the **openwakeword** demo script by
-David Scripka (Apache‑2.0, 2022) but wrapped in an easy‑to‑reuse
+David Scripka (Apache‑2.0, 2022) but wrapped in an easy‑to‑reuse
 `WakewordDetector` class.
 
 Differences to the reference script
@@ -11,7 +11,7 @@ Differences to the reference script
   programmatic *add_wake_word()* at runtime.
 * Supports both a single `.tflite` model file *or* the bundled model
   pack when `model_path` is empty.
-* Uses **PyAudio** for microphone capture (16 kHz, mono, int16).
+* Uses shared audio handler for microphone capture.
 
 Quick CLI test
 --------------
@@ -33,6 +33,13 @@ import numpy as np
 import pyaudio
 from openwakeword.model import Model
 
+try:
+    from audio import InOutHandler, AudioUser
+except ImportError:
+    # For standalone testing
+    InOutHandler = None
+    AudioUser = None
+
 __all__ = ["WakewordDetector"]
 
 # ---------------------------------------------------------------------------
@@ -45,7 +52,7 @@ class WakewordDetector:
     _RATE = 16_000  # Hz
     _CHANNELS = 1
     _FORMAT = pyaudio.paInt16
-    _DEFAULT_CHUNK = 1_280  # ≈ 80 ms @ 16 kHz
+    _DEFAULT_CHUNK = 1_280  # ≈ 80 ms @ 16 kHz
     _SUPPRESSION_SEC = 1.0
 
     def __init__(
@@ -55,6 +62,7 @@ class WakewordDetector:
         chunk_size: int = _DEFAULT_CHUNK,
         inference_framework: str = "tflite",
         sensitivity: float = 0.5,
+        audio_handler: Optional[InOutHandler] = None,
     ) -> None:
         """Parameters
         ----------
@@ -63,11 +71,13 @@ class WakewordDetector:
             containing several models.  If *None* or empty, all built‑in
             openwakeword models are loaded.
         chunk_size
-            Number of samples to read per `pyaudio.Stream.read()` call.
+            Number of samples to read per audio chunk.
         inference_framework
             Either ``"tflite"`` (CPU/GPU) or ``"onnx"`` (CPU).
         sensitivity
-            Probability threshold in [0, 1]; above → trigger.
+            Probability threshold in [0, 1]; above → trigger.
+        audio_handler
+            Optional shared audio handler. If None, a private PyAudio instance will be used.
         """
         self._chunk = int(chunk_size)
         self._threshold = float(sensitivity)
@@ -89,9 +99,11 @@ class WakewordDetector:
         # Callback function (word, timestamp) -> None
         self._callback: Optional[Callable[[str, float], None]] = None
 
-        # PyAudio setup ---------------------------------------------------
-        self._pa = pyaudio.PyAudio()
+        # Audio handling ---------------------------------------------------
+        self._audio_handler = audio_handler
+        self._pa = None if audio_handler else pyaudio.PyAudio()
         self._stream: Optional[pyaudio.Stream] = None
+        self._using_shared_audio = audio_handler is not None
 
         # Threading -------------------------------------------------------
         self._running = threading.Event()
@@ -112,12 +124,15 @@ class WakewordDetector:
         self._running.clear()
         if self._thread:
             self._thread.join(timeout=1.0)
-        if self._stream:
-            self._stream.stop_stream()
-            self._stream.close()
-            self._stream = None
-        if self._pa:
-            self._pa.terminate()
+        
+        # Only close private resources, not shared ones
+        if not self._using_shared_audio:
+            if self._stream:
+                self._stream.stop_stream()
+                self._stream.close()
+                self._stream = None
+            if self._pa:
+                self._pa.terminate()
 
     def join(self, timeout: float | None = None) -> None:
         if self._thread:
@@ -147,6 +162,9 @@ class WakewordDetector:
     # ------------------------------------------------------------------
 
     def _open_stream(self) -> None:
+        if self._using_shared_audio:
+            return  # Using shared audio handler, no stream to open
+            
         if self._stream is None:
             self._stream = self._pa.open(
                 format=self._FORMAT,
@@ -158,10 +176,19 @@ class WakewordDetector:
 
     def _loop(self) -> None:
         self._open_stream()
-        assert self._stream is not None
-        while self._running.is_set():
-            raw = self._stream.read(self._chunk, exception_on_overflow=False)
-            self._process_chunk(raw)
+        
+        if self._using_shared_audio:
+            # Use the shared audio handler
+            for raw in self._audio_handler.get_wakeword_chunks(self._chunk):
+                if not self._running.is_set():
+                    break
+                self._process_chunk(raw)
+        else:
+            # Use private audio stream
+            assert self._stream is not None
+            while self._running.is_set():
+                raw = self._stream.read(self._chunk, exception_on_overflow=False)
+                self._process_chunk(raw)
 
     # .................................................................
 
@@ -191,13 +218,21 @@ def _cli() -> None:
     parser.add_argument("--model_path", type=str, default="models/robo-cup.tflite", help="Path to a specific model or folder of models")
     parser.add_argument("--inference_framework", type=str, default="tflite", choices=["tflite", "onnx"])
     parser.add_argument("--threshold", type=float, default=0.5, help="Trigger threshold 0‑1")
+    parser.add_argument("--use_handler", action="store_true", help="Use shared audio handler")
     args = parser.parse_args()
 
+    # Create audio handler if requested
+    audio_handler = None
+    if args.use_handler and InOutHandler is not None:
+        audio_handler = InOutHandler()
+        audio_handler.start()
+    
     det = WakewordDetector(
         model_path=args.model_path or None,
         chunk_size=args.chunk_size,
         inference_framework=args.inference_framework,
         sensitivity=args.threshold,
+        audio_handler=audio_handler,
     )
 
     det.start()
@@ -205,6 +240,8 @@ def _cli() -> None:
         det.join()
     except KeyboardInterrupt:
         det.stop()
+        if audio_handler:
+            audio_handler.stop()
 
 
 if __name__ == "__main__":

@@ -33,6 +33,10 @@ from langgraph.graph import StateGraph, START, END
 from langgraph.prebuilt import ToolNode
 from langgraph.types import Command
 
+from dotenv import load_dotenv
+
+load_dotenv(".env")  # Load environment variables from .env file
+
 # ---------------------------------------------------------------------------
 # Prompts
 # ---------------------------------------------------------------------------
@@ -207,7 +211,14 @@ class Brain:
         # LangGraph is synchronous; run in thread so *Brain* can be awaited.
         def _run():
             res = self._graph.invoke({"messages": [("human", text)]})
-            return res["messages"][-1].content
+            res = res["results"][-1]
+            # find what's between { and } inclusive
+            match = re.search(r"\{(.*?)\}", res)
+            if match:
+                res = match.group(0)
+            res = json.loads(res)["message"] if res else "No result"
+
+            return res
 
         import asyncio  # lazy import to avoid at top level
 

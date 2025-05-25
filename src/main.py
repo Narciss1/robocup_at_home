@@ -4,12 +4,13 @@ together into the canonical loop:
 
     wait → listen → think → speak → wait
 
-Requires the three sibling modules generated earlier:
+Requires the sibling modules generated earlier:
 
-* ``wakeword.py`` – based on openwakeword + PyAudio
-* ``stt.py``       – realtime Whisper + webrtcvad
-* ``tts.py``       – any TTS backend (not shown here; plug in yours)
-* ``brain.py``     – your application logic (stubbed below)
+* ``audio.py``    - shared microphone resource handler
+* ``wakeword.py`` – based on openwakeword
+* ``stt.py``      – realtime Whisper + webrtcvad
+* ``tts.py``      – any TTS backend 
+* ``agent.py``    – your application logic
 
 Run ``python main.py`` and say your wake‑word (e.g. *"hey_bot"*).
 """
@@ -21,6 +22,7 @@ import signal
 from pathlib import Path
 from typing import Optional
 
+from audio import InOutHandler
 from wakeword import WakewordDetector
 from stt import STT
 from tts import TTS
@@ -59,18 +61,24 @@ class RobotLoop:  # noqa: WPS601
         # Will be filled in once the event loop is running
         self._loop: Optional[asyncio.AbstractEventLoop] = None
 
+        # 0) Shared audio handler -------------------------------------------
+        self.audio_handler = InOutHandler()
+        self.audio_handler.start()
+
         # 1) Wake-word detector (runs in its own thread) -------------------
         self.detector = WakewordDetector(
             model_path=cfg.wake_model_path,
             chunk_size=cfg.chunk_size,
             inference_framework=cfg.inference_framework,
             sensitivity=cfg.threshold,
+            audio_handler=self.audio_handler,
         )
 
         # 2) Speech-to-text -------------------------------------------------
         self.stt = STT(
             model=cfg.stt_model,
             language=cfg.stt_language,
+            audio_handler=self.audio_handler,
         )
 
         # 3) Brain + voice --------------------------------------------------
@@ -146,6 +154,7 @@ class RobotLoop:  # noqa: WPS601
         print("Shutting down …")
         self.detector.stop()
         self.stt.stop()
+        self.audio_handler.stop()
 
 
 # ---------------------------------------------------------------------------

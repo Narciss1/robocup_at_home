@@ -5,12 +5,10 @@ in chat.
 
 Requirements
 ~~~~~~~~~~~~
-    pip install faster-whisper webrtcvad sounddevice numpy
+    pip install faster-whisper webrtcvad numpy
 
 * If a GPU is available it will be auto‑detected by faster‑whisper.
-* The module captures microphone audio at 16 kHz mono 16‑bit to match
-  Whisper’s expected format.  If you pass your own ``audio_source``
-  iterator it must yield the *same* format.
+* The module uses a shared audio handler for audio input.
 """
 from __future__ import annotations
 
@@ -24,9 +22,15 @@ from pathlib import Path
 from typing import AsyncIterator, Iterator, List, Optional
 
 import numpy as np
-import sounddevice as sd
 import webrtcvad
 from faster_whisper import WhisperModel
+
+try:
+    from audio import InOutHandler, AudioUser
+except ImportError:
+    # For standalone testing
+    InOutHandler = None
+    AudioUser = None
 
 __all__ = ["STT"]
 
@@ -35,7 +39,7 @@ __all__ = ["STT"]
 # ---------------------------------------------------------------------------
 
 _SAMPLE_RATE = 16_000
-_CHUNK_SIZE = 480            # 30 ms @ 16 kHz = 480 frames
+_CHUNK_SIZE = 480            # 30 ms @ 16 kHz = 480 frames
 _SAMPLE_WIDTH = 2            # 16‑bit
 _SILENCE_AFTER_SPEECH = 0.8  # sec of non‑speech to stop recording
 
@@ -47,6 +51,8 @@ def _microphone_source() -> Iterator[bytes]:
     def _callback(indata, _frames, _time, _status):  # noqa: ANN001
         q.put_nowait(indata.copy().tobytes())
 
+    import sounddevice as sd  # Only import if needed
+    
     with sd.InputStream(
         samplerate=_SAMPLE_RATE,
         blocksize=_CHUNK_SIZE,
@@ -79,8 +85,21 @@ class STT:
         model: str | Path,
         language: str = "en",
         vad_aggressiveness: int = 2,
-        audio_source: "AudioSource" | None = None,
+        audio_handler: Optional[InOutHandler] = None,
     ) -> None:
+        """Initialize the STT engine.
+        
+        Parameters
+        ----------
+        model
+            Whisper model name or path
+        language
+            Language code (ISO-639-1)
+        vad_aggressiveness
+            Voice activity detection sensitivity (0-3)
+        audio_handler
+            Optional shared audio handler. If None, a private audio source will be used.
+        """
         # Whisper backbone ---------------------------------------------------
         self._whisper = WhisperModel(str(model), device="auto", compute_type="int8")
         self._language = language
@@ -88,9 +107,14 @@ class STT:
         # Voice activity detector -------------------------------------------
         self._vad = webrtcvad.Vad(vad_aggressiveness)
 
-        # Audio source (blocking iterator that yields bytes) -----------------
-        self._audio_source_iter = audio_source or _microphone_source()
-
+        # Audio handling ---------------------------------------------------
+        self._audio_handler = audio_handler
+        self._using_shared_audio = audio_handler is not None
+        
+        # If no shared handler, create a default audio source
+        if not self._using_shared_audio:
+            self._audio_source_iter = _microphone_source()
+        
         # Runtime state ------------------------------------------------------
         self._listen_task: Optional[asyncio.Task[str]] = None
         self._stop_event = asyncio.Event()
@@ -125,6 +149,10 @@ class STT:
         if self._listen_task:
             # Best‑effort cancellation; result will be ''
             self._listen_task.cancel(msg="STT.stop() called")
+        
+        # Release audio access if using shared handler
+        if self._using_shared_audio and AudioUser is not None:
+            self._audio_handler.release_access(AudioUser.STT)
 
     # ----------------------------------------------------------------------
     # Internals
@@ -137,28 +165,46 @@ class STT:
         silence_start: float | None = None
         started_speaking = False
         start_time = time.time()
+        
+        # Get appropriate audio source
+        if self._using_shared_audio:
+            # Request exclusive access to the microphone
+            if not self._audio_handler.request_access(AudioUser.STT):
+                print("Failed to get exclusive microphone access for STT")
+                return ""
+            audio_source = self._audio_handler.get_stt_chunks()
+        else:
+            # Use private audio source
+            audio_source = self._audio_source_iter
+            
+        # Process audio chunks
+        try:
+            async for chunk in _aiter_from_sync(audio_source):
+                if self._stop_event.is_set():
+                    break
 
-        async for chunk in _aiter_from_sync(self._audio_source_iter):
-            if self._stop_event.is_set():
-                break
+                if not started_speaking and (time.time() - start_time) > 1.5:
+                    # If no speech within 1.5 s, keep waiting but reset the timer.
+                    start_time = time.time()
 
-            if not started_speaking and (time.time() - start_time) > 1.5:
-                # If no speech within 1.5 s, keep waiting but reset the timer.
-                start_time = time.time()
+                is_speech = self._vad.is_speech(chunk, _SAMPLE_RATE)
+                if is_speech:
+                    speech_chunks.append(chunk)
+                    started_speaking = True
+                    silence_start = None
+                else:
+                    if started_speaking:
+                        if silence_start is None:
+                            silence_start = time.time()
+                        elif (time.time() - silence_start) > _SILENCE_AFTER_SPEECH:
+                            break  # end of utterance
 
-            is_speech = self._vad.is_speech(chunk, _SAMPLE_RATE)
-            if is_speech:
-                speech_chunks.append(chunk)
-                started_speaking = True
-                silence_start = None
-            else:
-                if started_speaking:
-                    if silence_start is None:
-                        silence_start = time.time()
-                    elif (time.time() - silence_start) > _SILENCE_AFTER_SPEECH:
-                        break  # end of utterance
-
-            await asyncio.sleep(0)  # let event loop breathe
+                await asyncio.sleep(0)  # let event loop breathe
+                
+        finally:
+            # Always release access when done if using shared handler
+            if self._using_shared_audio and AudioUser is not None:
+                self._audio_handler.release_access(AudioUser.STT)
 
         if not speech_chunks:
             return ""
@@ -194,7 +240,15 @@ class STT:
     # ..................................................................
 
     async def _play_chime(self) -> None:
-        """Non‑blocking 440 Hz beep for 100 ms so user knows to speak."""
+        """Non‑blocking 440 Hz beep for 100 ms so user knows to speak."""
+        if self._using_shared_audio:
+            # Use shared audio handler for chime
+            await self._audio_handler.play_chime()
+            return
+            
+        # Fall back to default implementation
+        import sounddevice as sd  # Only import if needed
+        
         duration = 0.1
         t = np.linspace(0, duration, int(_SAMPLE_RATE * duration), endpoint=False)
         wave = (0.1 * np.sin(2 * math.pi * 440 * t)).astype(np.float32)
@@ -209,7 +263,13 @@ class STT:
 
 async def _cli_loop(args: argparse.Namespace) -> None:
     """Simple REPL‑style loop: chime, listen, print transcript."""
-    stt = STT(args.model, language=args.language)
+    # Create audio handler if requested
+    audio_handler = None
+    if args.use_handler and InOutHandler is not None:
+        audio_handler = InOutHandler()
+        audio_handler.start()
+    
+    stt = STT(args.model, language=args.language, audio_handler=audio_handler)
     print("Speak after the chime – press Ctrl‑C to quit.\n")
     try:
         while True:
@@ -222,6 +282,8 @@ async def _cli_loop(args: argparse.Namespace) -> None:
     except KeyboardInterrupt:
         print("\nStopping…")
         stt.stop()
+        if audio_handler:
+            audio_handler.stop()
 
 
 def _build_argparser() -> argparse.ArgumentParser:
@@ -231,6 +293,9 @@ def _build_argparser() -> argparse.ArgumentParser:
     )
     p.add_argument(
         "-l", "--language", default="en", help="Language code (ISO‑639‑1)"
+    )
+    p.add_argument(
+        "--use_handler", action="store_true", help="Use shared audio handler"
     )
     return p
 
