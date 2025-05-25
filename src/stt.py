@@ -25,12 +25,7 @@ import numpy as np
 import webrtcvad
 from faster_whisper import WhisperModel
 
-try:
-    from audio import InOutHandler, AudioUser
-except ImportError:
-    # For standalone testing
-    InOutHandler = None
-    AudioUser = None
+from audio import InOutHandler, AudioUser
 
 __all__ = ["STT"]
 
